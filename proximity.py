@@ -3,150 +3,122 @@ from binaryninja.flowgraph import FlowGraph, FlowGraphNode
 from binaryninja.enums import InstructionTextTokenType, BranchType
 from binaryninjaui import FlowGraphWidget, ViewType
 
-class ProximityGraph(FlowGraph):
-    def __init__(self, funcs, edges):
-        super(ProximityGraph, self).__init__()
-        self.prox = {}
-        self.funcs = funcs
-        
-        for i in self.funcs:
-            if type(i) != Function:
-                print(type(i))
-                return False
+#TODO: highlight red on update, change edges to red, 
+#TODO: handle function updates
+#TODO: handle data and imports
+#TODO: first flowgraph always saved :/ opening a second bndb fails
+#TODO: move to per-function proximity
 
+class ProximityGraph(FlowGraph):
+    def __init__(self, bv, prox_nodes={}, edges={}):
+        super(ProximityGraph, self).__init__()
+        self.prox_nodes = prox_nodes
         self.edges = edges
+
+        self.bv = bv
 
         self.uses_block_highlights = True
         self.uses_instruction_highlights = False
         self.includes_user_comments = True
         self.allows_patching = False
-    
+
 
     def populate_nodes(self):
-        nodes = []
-        for i in self.funcs:
-            self.add_node(i)
-            #print("Added node for: {}".format(i.name))
+        # TODO: configurable initial depth setting
 
-        for src_func in self.edges:
-            for end_func in self.edges[src_func]:
-                self.add_edge(src_func, end_func)
-        
-        for node in nodes:
-            self.append(node)
+        if self.prox_nodes != {}:
+            for func in self.prox_nodes:
+                node = self.prox_nodes[func]
+                self.append(node)
+
+            for edge_start in self.edges:
+                for edge_end in self.edges[edge_start]:
+                    self.add_edge(edge_start, edge_end)
+            return
+
+        # queue the ones that we have in prox_nodes but not as a key in edges
+        queue = [self.bv.entry_function]
+        while len(queue) != 0:
+            print(len(queue))
+            func = queue.pop(0)
+            if func in self.edges:
+                continue
+            self.prox_for_func(func)
+            queue += self.edges[func]
+
+
+    def prox_for_func(self, f):
+        if not f in self.edges:
+            self.edges[f] = set()
+        prox = set()
+        for r in self.bv.get_code_refs_from(f.start, f, f.arch, f.highest_address - f.lowest_address):
+            ref_func = self.bv.get_function_at(r)
+            if ref_func is None:
+                print(f"Not a real function: 0x{r:x}")
+                continue
+            self.add_edge(f, ref_func)
+            prox.add(ref_func)
+        return prox
+
+
 
     def add_node(self, func):
         func_node = FlowGraphNode(self)
         line = DisassemblyTextLine([])
         line.tokens.append(InstructionTextToken(InstructionTextTokenType.CodeSymbolToken, func.name, value=func.start, address=func.start))
         func_node.lines = [line]
+        self.prox_nodes[func] = func_node
         self.append(func_node)
+        return func_node
 
-    def find_func_node(self, func):
-        for i in self.nodes:
-            if i.lines[0].tokens[0].address == func.start:
-                return i
-        return None
 
     def add_edge(self, start_func, end_func):
-        start_func_node = self.find_func_node(start_func)
-        end_func_node = self.find_func_node(end_func)
+        start_node = self.prox_nodes.get(start_func)
+        end_node = self.prox_nodes.get(end_func)
 
-        if not start_func_node:
-            self.add_node(start_func)
-            start_func_node = self.find_func_node(start_func)
-        
-        if not end_func_node:
-            self.add_node(end_func)
-            end_func_node = self.find_func_node(end_func)
-        
-        #TODO do nothing if edge already exists
-        start_func_node.add_outgoing_edge(BranchType.UnconditionalBranch, end_func_node)
-        #print("added edge: {} -> {}".format(start_func.name, end_func.name))
+        if start_node is None:
+            start_node = self.add_node(start_func)
+
+        if end_node is None:
+            end_node = self.add_node(end_func)
+
+        if not start_func in self.edges:
+            print("AAAAAAAAAAAAAAAAAAAAAA", start_func)
+            self.edges[start_func] = set([end_func])
+        else:
+            # don't add duplicate edges
+            if end_func in self.edges[start_func]:
+                return
+            self.edges[start_func].add(end_func)
+
+        start_node.add_outgoing_edge(BranchType.UnconditionalBranch, end_node)
+        print("added edge: {} -> {}".format(start_func.name, end_func.name))
+
 
     def update(self):
-        return ProximityGraph(self.funcs, self.edges)
-
-
+        return ProximityGraph(self.bv, self.prox_nodes, self.edges)
 
 
 class ProximityView(FlowGraphWidget):
-    def __init__(self, parent, data):
-        self.data = data
-        self.function = data.entry_function
-        self.graph = None
-        self.proximity_map = {}
+    def __init__(self, parent, bv):
+        self.bv = bv
         # TODO: update proximity map when functions added/removed/updated
 
-        # init every func proximity to empty
-        for func in self.data.functions:
-            self.proximity_map[func] = set()
-        
-        # populate func proximity
-        for function in self.data.functions:
-            for ref_func in self.get_functions_that_ref(function):
-                self.proximity_map[ref_func].add(function)
-        
-        self.graph_funcs = [self.function]
-        self.graph_edges = {self.function: self.proximity_map[self.function]}
-        for i in self.proximity_map[self.function]:
-            self.graph_funcs.append(i)
+        self.graph = ProximityGraph(self.bv)
+        super(ProximityView, self).__init__(parent, self.bv, self.graph)
 
-        if not self.function is None:
-            self.graph = ProximityGraph(self.graph_funcs, self.graph_edges)
-        super(ProximityView, self).__init__(parent, data, self.graph)
-
-
-    def get_functions_that_ref(self, func):
-        out = set()
-        refs = self.data.get_code_refs(func.start)
-        for ref in refs:
-            funcs = self.data.get_functions_containing(ref.address)
-            if not funcs:
-                continue
-            for ref_func in funcs:
-                out.add(ref_func)
-        return out
 
     def navigate(self, addr):
-        func = self.data.get_function_at(addr)
-        
-        if func is None:
-            # No function contains this address, fail navigation in this view
+        f = self.bv.get_function_at(addr)
+        if f is None:
             return False
-
-        return self.navigateToFunction(func, addr)
+        return self.navigateToFunction(f, addr)
 
     def navigateToFunction(self, func, addr):
-        # print("navigate")
-
-        if func in self.graph_funcs:
-            #print("func already in graph")
-            self.showAddress(addr, True)
-            if not func in self.graph_edges:
-                prox_funcs = self.proximity_map[func]
-                if len(prox_funcs) == 0:
-                    return True
-                for i in prox_funcs:
-                    self.graph_funcs.append(i)
-                self.graph_edges[func] = prox_funcs
-                self.graph = ProximityGraph(self.graph_funcs, self.graph_edges)
-                self.setGraph(self.graph, addr)
-            return True
-
-        #print("func not in graph")
-        # Moving to new function, empty everything
-        self.function = func
-        self.graph_funcs = [func]
-        for i in self.proximity_map[func]:
-            self.graph_funcs.append(i)
-        self.graph_edges = {func: self.proximity_map[func]}
-        newgraph = ProximityGraph(self.graph_funcs, self.graph_edges)
-        self.graph = newgraph
-        self.setGraph(self.graph, addr)
+        print(func, addr)
+        self.graph.prox_for_func(func)
+        self.setGraph(self.graph.update(), func.start)
         return True
-
-
 
 
 class ProximityViewType(ViewType):
@@ -165,4 +137,3 @@ class ProximityViewType(ViewType):
 
 # Register the view type so that it can be chosen by the user
 ViewType.registerViewType(ProximityViewType())
-
